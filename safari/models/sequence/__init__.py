@@ -7,6 +7,11 @@ except ImportError:
     pass
 
 try:
+    from .hyena_components import *
+except ImportError:
+    pass
+
+try:
     from .h3 import *
 except ImportError:
     pass
