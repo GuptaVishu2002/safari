@@ -6,4 +6,10 @@ setup(
     description="Forked research code from HazyResearch/safari",
     packages=find_packages(),
     include_package_data=True,
+    python_requires=">=3.8",
+    install_requires=[
+        "torch>=1.10",
+        "einops",
+        "opt_einsum",
+    ],
 )
