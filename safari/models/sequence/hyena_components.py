@@ -1,5 +1,6 @@
 """
-Standalone Hyena components without registry dependencies.
+Hyena layers and components.
+Core implementation without model wrapper.
 """
 
 import math
@@ -23,8 +24,8 @@ def fftconv_ref(u, k, D, dropout_mask, gelu=True, k_rev=None):
         k_f = k_f.unsqueeze(1)
 
     y = torch.fft.irfft(u_f * k_f, n=fft_size, norm='forward')[..., :seqlen]
-
     out = y + u * D.unsqueeze(-1)
+    
     if gelu:
         out = F.gelu(out)
     if dropout_mask is not None:
@@ -52,7 +53,6 @@ class PositionalEmbedding(nn.Module):
     """Complex exponential positional embeddings for Hyena filters"""
     def __init__(self, emb_dim: int, seq_len: int, **kwargs):
         super().__init__()
-        
         self.seq_len = seq_len
         t = torch.linspace(0, 1, self.seq_len)[None, :, None]
         
@@ -101,7 +101,6 @@ class ExponentialModulation(nn.Module):
 
 
 class HyenaFilter(nn.Module):
-    """Standalone Hyena filter without registry dependencies"""
     def __init__(
         self, 
         d_model,
@@ -126,7 +125,6 @@ class HyenaFilter(nn.Module):
   
         self.pos_emb = PositionalEmbedding(emb_dim, seq_len)
 
-        # Build MLP
         layers = [nn.Linear(emb_dim, order), act]
         for i in range(num_inner_mlps):
             layers.append(nn.Linear(order, order))
@@ -151,13 +149,12 @@ class HyenaFilter(nn.Module):
             bias = self.bias
         bias = bias if self.use_bias else 0 * bias
 
-        # Use reference implementation
         y = fftconv_ref(x, k, bias, dropout_mask=None, gelu=False)
         return y
 
 
 class HyenaOperator(nn.Module):
-    """Standalone Hyena operator without registry dependencies"""
+    """Hyena operator - main recurrent block"""
     def __init__(
         self,
         d_model,
@@ -174,8 +171,8 @@ class HyenaOperator(nn.Module):
     ):
         super().__init__()
         
-        assert d_model % num_heads == 0, f'Model dimension {d_model} must be divisible by num heads {num_heads}'
-        assert l_max % num_blocks == 0, f'Maximum signal length {l_max} must be divisible by block dimension {num_blocks}'
+        assert d_model % num_heads == 0
+        assert l_max % num_blocks == 0
         
         self.d_model = d_model
         self.order = order
@@ -183,35 +180,28 @@ class HyenaOperator(nn.Module):
         self.num_heads = num_heads
         self.inner_factor = inner_factor
         self.num_blocks = num_blocks
-        self.filter_order = filter_order
-        self.short_filter_order = short_filter_order
-        self.filter_dropout = filter_dropout
-        
         self.block_dim = l_max // num_blocks
         self.head_dim = d_model // num_heads
         
         self.dropout = nn.Dropout(dropout)
         
-        # Projections
         self.out_proj = nn.Linear(self.d_model * inner_factor, self.d_model)
         self.in_proj = nn.Linear(self.d_model, (self.order + 1) * self.d_model)
         
-        # Short filter
         total_width = self.d_model * self.inner_factor * (self.order + 1)
         self.short_filter = nn.Conv1d(
             in_channels=total_width,
             out_channels=total_width,
-            kernel_size=self.short_filter_order,
+            kernel_size=short_filter_order,
             groups=total_width,
-            padding=self.short_filter_order - 1
+            padding=short_filter_order - 1
         )
         
-        # Long implicit filter
         self.filter_fn = HyenaFilter(
             self.head_dim * self.inner_factor * (self.order - 1),
-            order=self.filter_order,
+            order=filter_order,
             seq_len=self.l_max,
-            dropout=self.filter_dropout,
+            dropout=filter_dropout,
             **filter_args
         )
 
@@ -247,7 +237,6 @@ class HyenaOperator(nn.Module):
             h=self.num_heads
         )
         y = self.out_proj(y)
-        
         return y
 
     @property
