@@ -1,6 +1,5 @@
 """
-Hyena layers and components.
-Core implementation without model wrapper.
+Hyena layers and components - properly aligned with original.
 """
 
 import math
@@ -11,7 +10,6 @@ from einops import rearrange
 
 
 def fftconv_ref(u, k, D, dropout_mask, gelu=True, k_rev=None):
-    """Reference convolution with residual connection"""
     seqlen = u.shape[-1]
     fft_size = 2 * seqlen
     k_f = torch.fft.rfft(k, n=fft_size) / fft_size
@@ -40,7 +38,6 @@ def mul_sum(q, y):
 
 
 class Sin(nn.Module):
-    """Sinusoidal activation function"""
     def __init__(self, dim, w=10, train_freq=True):
         super().__init__()
         self.freq = nn.Parameter(w * torch.ones(1, dim)) if train_freq else w * torch.ones(1, dim)
@@ -50,7 +47,6 @@ class Sin(nn.Module):
 
 
 class PositionalEmbedding(nn.Module):
-    """Complex exponential positional embeddings for Hyena filters"""
     def __init__(self, emb_dim: int, seq_len: int, **kwargs):
         super().__init__()
         self.seq_len = seq_len
@@ -74,7 +70,6 @@ class PositionalEmbedding(nn.Module):
 
 
 class ExponentialModulation(nn.Module):
-    """Exponential modulation for implicit filters"""
     def __init__(
         self,
         d_model,
@@ -111,6 +106,7 @@ class HyenaFilter(nn.Module):
         w=1,
         bias=True,
         num_inner_mlps=2,
+        normalized=False,
         **kwargs
     ):
         super().__init__()
@@ -121,6 +117,7 @@ class HyenaFilter(nn.Module):
         
         act = Sin(dim=order, w=w)
         self.emb_dim = emb_dim
+        assert emb_dim % 2 != 0 and emb_dim >= 3
         self.seq_len = seq_len
   
         self.pos_emb = PositionalEmbedding(emb_dim, seq_len)
@@ -133,11 +130,14 @@ class HyenaFilter(nn.Module):
         
         self.implicit_filter = nn.Sequential(*layers)
         self.modulation = ExponentialModulation(d_model, **kwargs)
+        self.normalized = normalized
 
     def filter(self, L):
         z, t = self.pos_emb(L)
         h = self.implicit_filter(z)
         h = self.modulation(t, h)
+        if self.normalized:
+            h = h / torch.norm(h, dim=-1, p=1, keepdim=True)
         return h
 
     def forward(self, x, L, k=None, bias=None):
@@ -154,7 +154,6 @@ class HyenaFilter(nn.Module):
 
 
 class HyenaOperator(nn.Module):
-    """Hyena operator - main recurrent block"""
     def __init__(
         self,
         d_model,
@@ -221,7 +220,8 @@ class HyenaOperator(nn.Module):
             v=self.head_dim * (self.order + 1)
         )
 
-        *x, v = uc.split(self.d_model, dim=2)
+        *x, v = uc.split(self.head_dim, dim=2)
+        
         k = self.filter_fn.filter(l_filter)
         
         k = rearrange(k, 'c l (v o) -> c o v l', v=self.head_dim, o=self.order - 1)[0]
@@ -242,3 +242,156 @@ class HyenaOperator(nn.Module):
     @property
     def d_output(self):
         return self.d_model
+
+
+class HyenaModel(nn.Module):
+    def __init__(
+        self,
+        vocabulary,
+        n_layers=4,
+        d_model=256,
+        order=2,
+        filter_order=64,
+        num_heads=1,
+        dropout=0.25,
+        max_len=250,
+        **hyena_args
+    ):
+        super(HyenaModel, self).__init__()
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.vocabulary = vocabulary
+        self.vocabulary_size = len(vocabulary)
+        self.padding_idx = vocabulary.dictionary["<PAD>"]
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.dropout = dropout
+        self.max_len = max_len
+        
+        self.embedding = nn.Embedding(
+            self.vocabulary_size, d_model, padding_idx=self.padding_idx
+        )
+        
+        self.hyena_layers = nn.ModuleList([
+            HyenaOperator(
+                d_model=d_model,
+                l_max=max_len,
+                order=order,
+                filter_order=filter_order,
+                num_heads=num_heads,
+                dropout=dropout,
+                **hyena_args
+            )
+            for _ in range(n_layers)
+        ])
+        
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(n_layers)
+        ])
+        
+        self.dropout_layer = nn.Dropout(dropout)
+        self.output_embedding = nn.Linear(d_model, self.vocabulary_size)
+        self.loss_fn = nn.CrossEntropyLoss(
+            ignore_index=self.padding_idx, reduction="none"
+        )
+        
+        if torch.cuda.is_available():
+            self.cuda()
+    
+    def forward(self, x):
+        x = self.embedding(x)
+        
+        for hyena_layer, layer_norm in zip(self.hyena_layers, self.layer_norms):
+            residual = x
+            x = layer_norm(x)
+            x = hyena_layer(x)
+            x = self.dropout_layer(x)
+            x = x + residual
+        
+        return self.output_embedding(x)
+    
+    def loss(self, batch):
+        if len(batch) == 3:
+            padded, lengths, _ = batch
+        else:
+            padded, lengths = batch
+        
+        padded = padded.to(self.device)
+        if padded.dim() == 2:
+            padded = padded.transpose(0, 1)
+        
+        logits = self(padded)
+        targets = padded[:, 1:]
+        logits = logits[:, :-1, :]
+        
+        loss = 0.0
+        actual_len = min(logits.shape[1], targets.shape[1])
+        for char_idx in range(actual_len):
+            loss += self.loss_fn(logits[:, char_idx, :], targets[:, char_idx])
+        
+        return loss.mean()
+    
+    def sample(
+        self,
+        *,
+        n_sequences,
+        max_len=None,
+        return_smiles=True,
+        return_losses=False,
+        descriptors=None,
+    ):
+        if max_len is None:
+            max_len = self.max_len
+        
+        self.eval()
+        
+        start_token = self.vocabulary.dictionary["SOS"]
+        stop_token = self.vocabulary.dictionary["EOS"]
+        pad_token = self.vocabulary.dictionary["<PAD>"]
+        
+        inputs = torch.empty(n_sequences).fill_(start_token).long().to(self.device)
+        loss_fn = nn.NLLLoss(reduction="none", ignore_index=pad_token)
+        
+        finished = torch.zeros(n_sequences).byte().to(self.device)
+        log_probs = torch.zeros(n_sequences).to(self.device)
+        sequences = []
+        
+        with torch.no_grad():
+            for step in range(max_len):
+                if step == 0:
+                    current_seq = inputs.unsqueeze(1)
+                else:
+                    seq_list = [inputs.unsqueeze(1)] + sequences
+                    current_seq = torch.cat(seq_list, dim=1)
+                
+                logits = self(current_seq)
+                logits = logits[:, -1, :]
+                
+                logits = torch.clamp(logits, min=-1e4, max=1e4)
+                prob = F.softmax(logits, dim=-1)
+                
+                if torch.isnan(prob).any() or torch.isinf(prob).any():
+                    break
+                
+                outputs = torch.multinomial(prob, num_samples=1).squeeze(1)
+                sequences.append(outputs.view(-1, 1))
+                
+                log_prob = F.log_softmax(logits, dim=-1)
+                losses = loss_fn(log_prob, outputs)
+                losses[finished.bool()] = 0
+                log_probs += losses
+                
+                finished = torch.ge(finished + (outputs == stop_token), 1)
+                if torch.prod(finished) == 1:
+                    break
+        
+        seqs = torch.cat(sequences, 1)
+        if return_smiles:
+            outputs = [self.vocabulary.decode(seq.cpu().numpy()) for seq in seqs]
+        else:
+            outputs = sequences
+        
+        if return_losses:
+            return outputs, log_probs.detach().cpu().numpy()
+        else:
+            return outputs
