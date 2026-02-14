@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from einops import rearrange
-from long_conv_kernel import LongConvKernel
+from safari.models.sequence.long_conv_kernel import LongConvKernel
 
 try:
     from safari.ops.fftconv import fftconv_func
